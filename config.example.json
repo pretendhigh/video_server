@@ -1,0 +1,40 @@
+{
+    "_comment": "Video Server Configuration File",
+    "_description": "Copy this file to config.json and modify values as needed. All fields are optional - missing values will use defaults.",
+
+    "server": {
+        "_comment": "Server network configuration",
+        "host": "0.0.0.0",
+        "_host_desc": "Bind address: 0.0.0.0 for all interfaces, 127.0.0.1 for localhost only",
+        "port": 8000,
+        "_port_desc": "Server port (1024-65535). Default: 8000",
+        "video_dir": ".",
+        "_video_dir_desc": "Root directory containing video files. Use absolute path or relative to server."
+    },
+
+    "playback": {
+        "_comment": "Video playback settings",
+        "speeds": [0.5, 1, 1.25, 1.5, 2, 3, 5],
+        "_speeds_desc": "Available playback speed options. Values must be positive numbers.",
+        "skip_duration": 10,
+        "_skip_duration_desc": "Seconds to skip forward/backward when using the skip buttons. Default: 10"
+    },
+
+    "logging": {
+        "_comment": "Logging configuration",
+        "level": "INFO",
+        "_level_desc": "Log level: DEBUG, INFO, WARNING, ERROR. Use DEBUG for troubleshooting.",
+        "max_bytes": 104857600,
+        "_max_bytes_desc": "Maximum log file size in bytes before rotation. Default: 104857600 (100 MB)",
+        "backup_count": 10,
+        "_backup_count_desc": "Number of backup log files to keep. Default: 10",
+        "format": "%(asctime)s [%(levelname)s] %(message)s",
+        "_format_desc": "Python logging format string. See: https://docs.python.org/3/library/logging.html"
+    },
+
+    "ui": {
+        "_comment": "User interface settings",
+        "controls_hide_delay": 3000,
+        "_controls_hide_delay_desc": "Time in milliseconds before hiding controls in fullscreen mode when mouse is idle. Default: 3000 (3 seconds)"
+    }
+}

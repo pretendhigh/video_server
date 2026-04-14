@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and data
+logs/
+*.log
+thumbnails/
+my_video/
+
+# Config (keep example)
+config.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
