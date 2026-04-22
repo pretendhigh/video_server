@@ -16,6 +16,7 @@ import copy
 import hashlib
 import subprocess
 import mimetypes
+import threading
 import logging
 import logging.handlers
 from pathlib import Path
@@ -23,9 +24,26 @@ from urllib.parse import quote, unquote
 from collections import defaultdict, deque
 from datetime import datetime
 
-from flask import Flask, render_template, jsonify, send_file, request, Response
+from flask import Flask, render_template, jsonify, send_file, request, Response, redirect, url_for
+from functools import wraps
+
+try:
+    from flask_sqlalchemy import SQLAlchemy
+    from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+    from werkzeug.security import generate_password_hash, check_password_hash
+    AUTH_LIBS_AVAILABLE = True
+except ImportError:
+    AUTH_LIBS_AVAILABLE = False
 
 app = Flask(__name__)
+
+# Auth-related globals (initialized conditionally)
+if AUTH_LIBS_AVAILABLE:
+    db = SQLAlchemy()
+    login_manager = LoginManager()
+else:
+    db = None
+    login_manager = None
 
 # Default configuration - used when config.json is missing or incomplete
 DEFAULT_CONFIG = {
@@ -44,8 +62,21 @@ DEFAULT_CONFIG = {
         "backup_count": 10,
         "format": "%(asctime)s [%(levelname)s] %(message)s"
     },
+    "scan": {
+        "content_hash_algorithms": ["sha1"],
+        "interval_seconds": 300
+    },
     "ui": {
         "controls_hide_delay": 3000  # milliseconds
+    },
+    "auth": {
+        "enabled": False,
+        "mode": "relaxed",
+        "secret_key": None,
+        "session_days": 7,
+        "users": [
+            {"username": "admin", "password": "changeme", "role": "admin"}
+        ]
     }
 }
 
@@ -66,9 +97,104 @@ VIDEO_DIR = Path(".")
 THUMBNAIL_DIR = Path("thumbnails")
 LOG_DIR = Path("logs")
 VIDEO_EXTENSIONS = {'.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.m4v'}
+HASH_CHUNK_SIZE = 1024 * 1024
+VIDEO_CACHE_LOCK = threading.Lock()
+VIDEO_CACHE_DATA = None
+VIDEO_CACHE_UPDATED_AT = None
+VIDEO_SCAN_THREAD = None
+VIDEO_SCAN_STOP_EVENT = threading.Event()
 
 # Global logger
 logger = logging.getLogger('video_server')
+
+
+def ascii_sort_key(value: str):
+    """Sort strings using their original code-point order without natural sorting."""
+    return value
+
+
+def category_sort_key(value: str):
+    """Keep Uncategorized first, then sort remaining categories by ASCII order."""
+    if value == 'Uncategorized':
+        return (0, value)
+    return (1, value)
+
+
+def normalize_hash_algorithm(name: str):
+    """Normalize configured hash algorithm names, allowing common *sum aliases."""
+    if not isinstance(name, str):
+        return None
+
+    normalized = name.strip().lower()
+    if not normalized:
+        return None
+
+    candidates = [normalized]
+    if normalized.endswith('sum'):
+        candidates.append(normalized[:-3])
+
+    for candidate in candidates:
+        if candidate in hashlib.algorithms_guaranteed:
+            return candidate
+
+    for candidate in candidates:
+        if candidate in hashlib.algorithms_available:
+            return candidate
+
+    return None
+
+
+def get_content_hash_algorithms():
+    """Return the configured content-hash algorithms and any invalid values."""
+    configured = CONFIG.get('scan', {}).get(
+        'content_hash_algorithms',
+        DEFAULT_CONFIG['scan']['content_hash_algorithms']
+    )
+
+    if isinstance(configured, str):
+        configured = [configured]
+
+    algorithms = []
+    invalid = []
+
+    for name in configured or []:
+        normalized = normalize_hash_algorithm(name)
+        if normalized is None:
+            invalid.append(str(name))
+            continue
+        if normalized not in algorithms:
+            algorithms.append(normalized)
+
+    if algorithms:
+        return algorithms, invalid
+
+    fallback = []
+    for name in DEFAULT_CONFIG['scan']['content_hash_algorithms']:
+        normalized = normalize_hash_algorithm(name)
+        if normalized and normalized not in fallback:
+            fallback.append(normalized)
+
+    return fallback, invalid
+
+
+def get_scan_interval_seconds():
+    """Get the configured scan interval in seconds. Zero disables automatic rescans."""
+    configured = CONFIG.get('scan', {}).get(
+        'interval_seconds',
+        DEFAULT_CONFIG['scan']['interval_seconds']
+    )
+
+    try:
+        interval_seconds = int(configured)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid scan.interval_seconds value %r, falling back to %s",
+            configured,
+            DEFAULT_CONFIG['scan']['interval_seconds']
+        )
+        return DEFAULT_CONFIG['scan']['interval_seconds']
+
+    return max(0, interval_seconds)
 
 
 def load_config():
@@ -148,11 +274,23 @@ def setup_logging():
     logger.info("=" * 60)
 
 
-def get_file_hash(file_path: Path) -> str:
-    """Generate a hash based on file content (size + mtime) for deduplication."""
-    stat = file_path.stat()
-    content = f"{stat.st_size}:{stat.st_mtime}"
-    return hashlib.md5(content.encode()).hexdigest()
+def get_file_content_signature(file_path: Path, algorithms: list[str]):
+    """Generate a content-hash signature for a file using one or more algorithms."""
+    hashers = [(algorithm, hashlib.new(algorithm)) for algorithm in algorithms]
+
+    try:
+        with open(file_path, 'rb') as handle:
+            while True:
+                chunk = handle.read(HASH_CHUNK_SIZE)
+                if not chunk:
+                    break
+                for _, hasher in hashers:
+                    hasher.update(chunk)
+    except OSError as exc:
+        logger.error(f"Failed to hash file {file_path}: {exc}")
+        return None
+
+    return tuple((algorithm, hasher.hexdigest()) for algorithm, hasher in hashers)
 
 
 def get_video_hash(video_path: Path) -> str:
@@ -272,10 +410,17 @@ def scan_videos(directory: Path) -> dict:
     """
     videos = []
     categories = defaultdict(list)
-    seen_names = {}  # name -> file_hash for deduplication
+    seen_names = defaultdict(list)  # name -> list of seen variants for deduplication
     duplicate_count = 0
+    hash_algorithms, invalid_hash_algorithms = get_content_hash_algorithms()
 
     logger.info(f"Scanning directory: {directory}")
+    logger.info(f"Duplicate detection content hash algorithms: {', '.join(hash_algorithms)}")
+    if invalid_hash_algorithms:
+        logger.warning(
+            "Ignoring unsupported content hash algorithms: "
+            + ", ".join(invalid_hash_algorithms)
+        )
 
     for root, dirs, files in os.walk(directory):
         root_path = Path(root)
@@ -296,18 +441,51 @@ def scan_videos(directory: Path) -> dict:
                     continue
 
                 name = file_path.stem
-                file_hash = get_file_hash(file_path)
+                size = file_path.stat().st_size
+                name_variants = seen_names[name]
+                current_signature = None
+                duplicate_match = None
 
                 # Check for duplicate (same name, same content)
-                if name in seen_names:
-                    if seen_names[name] == file_hash:
-                        logger.warning(f"Duplicate video skipped: {rel_path} (same as existing)")
-                        duplicate_count += 1
+                for seen_variant in name_variants:
+                    if seen_variant['size'] != size:
                         continue
-                    else:
-                        logger.warning(f"Same name but different content: {rel_path}")
 
-                seen_names[name] = file_hash
+                    if current_signature is None:
+                        current_signature = get_file_content_signature(file_path, hash_algorithms)
+                        if current_signature is None:
+                            break
+
+                    if seen_variant['content_signature'] is None:
+                        seen_variant['content_signature'] = get_file_content_signature(
+                            seen_variant['path'],
+                            hash_algorithms
+                        )
+
+                    if seen_variant['content_signature'] == current_signature:
+                        duplicate_match = seen_variant
+                        break
+
+                if duplicate_match is not None:
+                    logger.warning(
+                        f"Duplicate video skipped: {rel_path} "
+                        f"(same as {duplicate_match['rel_path']})"
+                    )
+                    duplicate_count += 1
+                    continue
+
+                if name_variants:
+                    logger.warning(
+                        f"Same name but different content: {rel_path} "
+                        f"(compared with {', '.join(hash_algorithms)})"
+                    )
+
+                name_variants.append({
+                    'path': file_path,
+                    'rel_path': rel_path,
+                    'size': size,
+                    'content_signature': current_signature
+                })
 
                 # Get category
                 category = get_category(rel_path)
@@ -316,8 +494,6 @@ def scan_videos(directory: Path) -> dict:
                 thumbnail, duration = generate_thumbnail(file_path)
 
                 # Get file size
-                size = file_path.stat().st_size
-
                 video_info = {
                     'id': get_video_hash(file_path),
                     'name': name,
@@ -338,12 +514,12 @@ def scan_videos(directory: Path) -> dict:
                 categories[category].append(video_info)
 
     # Sort videos by name
-    videos.sort(key=lambda x: x['name'].lower())
+    videos.sort(key=lambda x: ascii_sort_key(x['name']))
 
     # Sort categories
-    sorted_categories = dict(sorted(categories.items()))
+    sorted_categories = dict(sorted(categories.items(), key=lambda item: category_sort_key(item[0])))
     for cat in sorted_categories:
-        sorted_categories[cat].sort(key=lambda x: x['name'].lower())
+        sorted_categories[cat].sort(key=lambda x: ascii_sort_key(x['name']))
 
     logger.info(f"Scan complete: {len(videos)} videos found, {duplicate_count} duplicates skipped")
     logger.info(f"Categories: {list(sorted_categories.keys())}")
@@ -354,6 +530,81 @@ def scan_videos(directory: Path) -> dict:
         'count': len(videos),
         'duplicate_count': duplicate_count
     }
+
+
+def clear_thumbnail_cache() -> int:
+    """Delete cached thumbnail files and return the number removed."""
+    if not THUMBNAIL_DIR.exists():
+        return 0
+
+    count = 0
+    for thumbnail in THUMBNAIL_DIR.glob('*.jpg'):
+        try:
+            thumbnail.unlink()
+            count += 1
+        except OSError as exc:
+            logger.warning(f"Failed to remove thumbnail {thumbnail.name}: {exc}")
+    return count
+
+
+def refresh_video_cache(reason='manual refresh', clear_thumbnails=False) -> dict:
+    """Rebuild the in-memory video cache and return a deep copy of the new data."""
+    global VIDEO_CACHE_DATA, VIDEO_CACHE_UPDATED_AT
+
+    with VIDEO_CACHE_LOCK:
+        if clear_thumbnails:
+            cleared = clear_thumbnail_cache()
+            logger.info(f"Cleared {cleared} thumbnails")
+
+        logger.info(f"Refreshing video cache ({reason})")
+        VIDEO_CACHE_DATA = scan_videos(VIDEO_DIR)
+        VIDEO_CACHE_UPDATED_AT = datetime.utcnow()
+        return copy.deepcopy(VIDEO_CACHE_DATA)
+
+
+def get_video_cache() -> dict:
+    """Return a deep copy of the cached video data, initializing it on first use."""
+    global VIDEO_CACHE_DATA, VIDEO_CACHE_UPDATED_AT
+
+    with VIDEO_CACHE_LOCK:
+        if VIDEO_CACHE_DATA is None:
+            logger.info("Video cache is empty, performing initial scan")
+            VIDEO_CACHE_DATA = scan_videos(VIDEO_DIR)
+            VIDEO_CACHE_UPDATED_AT = datetime.utcnow()
+        return copy.deepcopy(VIDEO_CACHE_DATA)
+
+
+def periodic_video_scan_worker():
+    """Refresh the video cache on the configured interval."""
+    interval_seconds = get_scan_interval_seconds()
+
+    while interval_seconds > 0 and not VIDEO_SCAN_STOP_EVENT.wait(interval_seconds):
+        try:
+            refresh_video_cache(reason=f"scheduled scan every {interval_seconds}s")
+        except Exception as exc:
+            logger.error(f"Scheduled video scan failed: {exc}")
+
+
+def start_periodic_video_scan():
+    """Start the background scan worker when automatic refresh is enabled."""
+    global VIDEO_SCAN_THREAD
+
+    interval_seconds = get_scan_interval_seconds()
+    if interval_seconds <= 0:
+        logger.info("Automatic video rescans disabled; cache updates on startup and manual refresh")
+        return
+
+    if VIDEO_SCAN_THREAD and VIDEO_SCAN_THREAD.is_alive():
+        return
+
+    VIDEO_SCAN_STOP_EVENT.clear()
+    VIDEO_SCAN_THREAD = threading.Thread(
+        target=periodic_video_scan_worker,
+        name='video-scan-worker',
+        daemon=True
+    )
+    VIDEO_SCAN_THREAD.start()
+    logger.info(f"Automatic video rescans enabled every {interval_seconds} seconds")
 
 
 def format_size(size: int) -> str:
@@ -405,31 +656,285 @@ def serve_file_with_range(file_path: Path, mimetype: str):
     return send_file(file_path, mimetype=mimetype)
 
 
+# ===========================
+# Auth Models & Helpers
+# ===========================
+
+if AUTH_LIBS_AVAILABLE:
+    class User(UserMixin, db.Model):
+        __tablename__ = 'users'
+        id = db.Column(db.Integer, primary_key=True)
+        username = db.Column(db.String(80), unique=True, nullable=False, index=True)
+        password_hash = db.Column(db.String(256), nullable=False)
+        role = db.Column(db.String(20), nullable=False, default='user')
+        created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+        def set_password(self, password):
+            self.password_hash = generate_password_hash(password, method='pbkdf2:sha256')
+
+        def check_password(self, password):
+            return check_password_hash(self.password_hash, password)
+
+    class Favorite(db.Model):
+        __tablename__ = 'favorites'
+        id = db.Column(db.Integer, primary_key=True)
+        user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+        video_id = db.Column(db.String(32), nullable=False, index=True)
+        created_at = db.Column(db.DateTime, default=datetime.utcnow)
+        __table_args__ = (db.UniqueConstraint('user_id', 'video_id', name='uix_user_video'),)
+
+    class LoginLog(db.Model):
+        __tablename__ = 'login_logs'
+        id = db.Column(db.Integer, primary_key=True)
+        user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+        username = db.Column(db.String(80), nullable=False)
+        ip_address = db.Column(db.String(45), nullable=False)
+        user_agent = db.Column(db.String(256))
+        login_time = db.Column(db.DateTime, default=datetime.utcnow)
+        success = db.Column(db.Boolean, default=True)
+
+
+def is_auth_enabled():
+    """Check if authentication is enabled in config."""
+    return CONFIG.get('auth', {}).get('enabled', False) and AUTH_LIBS_AVAILABLE
+
+
+def get_auth_mode():
+    """Get current auth mode from config."""
+    return CONFIG.get('auth', {}).get('mode', 'relaxed')
+
+
+def get_or_create_secret_key():
+    """Get secret key from config or generate and persist one."""
+    key = CONFIG.get('auth', {}).get('secret_key')
+    if key:
+        return key
+    key_file = Path(__file__).parent / '.secret_key'
+    if key_file.exists():
+        return key_file.read_text().strip()
+    import secrets
+    key = secrets.token_hex(32)
+    key_file.write_text(key)
+    return key
+
+
+def init_auth(app):
+    """Initialize authentication components if enabled."""
+    if not is_auth_enabled():
+        return
+
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
+    app.config['SECRET_KEY'] = get_or_create_secret_key()
+    from datetime import timedelta
+    app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=CONFIG.get('auth', {}).get('session_days', 7))
+
+    db.init_app(app)
+    login_manager.init_app(app)
+    login_manager.login_view = 'login'
+
+    @login_manager.user_loader
+    def load_user(user_id):
+        return db.session.get(User, int(user_id))
+
+    with app.app_context():
+        db.create_all()
+        bootstrap_users()
+
+
+def bootstrap_users():
+    """Create initial users from config if they don't exist."""
+    users_config = CONFIG.get('auth', {}).get('users', [])
+    for user_cfg in users_config:
+        username = user_cfg.get('username')
+        if not username or User.query.filter_by(username=username).first():
+            continue
+        user = User(username=username, role=user_cfg.get('role', 'user'))
+        user.set_password(user_cfg.get('password', 'changeme'))
+        db.session.add(user)
+        logger.info(f"Created user: {username} (role: {user.role})")
+    db.session.commit()
+
+
+# ===========================
+# Auth Decorators
+# ===========================
+
+def require_auth(func):
+    """Require authentication based on auth mode."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not is_auth_enabled():
+            return func(*args, **kwargs)
+        if get_auth_mode() == 'strict' and not current_user.is_authenticated:
+            if request.is_json or request.path.startswith('/api/'):
+                return jsonify({'error': 'Login required'}), 401
+            return redirect(url_for('login'))
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def require_role(role):
+    """Require a specific role."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if not is_auth_enabled():
+                return func(*args, **kwargs)
+            if not current_user.is_authenticated:
+                return jsonify({'error': 'Login required'}), 401
+            if current_user.role != role:
+                return jsonify({'error': f'{role} access required'}), 403
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def require_login_for_feature(func):
+    """Require login for specific features in relaxed mode."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not is_auth_enabled():
+            return func(*args, **kwargs)
+        if not current_user.is_authenticated:
+            return jsonify({'error': 'Login required'}), 401
+        return func(*args, **kwargs)
+    return wrapper
+
+
+# ===========================
+# Routes
+# ===========================
+
 @app.route('/')
+@require_auth
 def index():
     """Render the main gallery page."""
-    return render_template('index.html')
+    return render_template('index.html', show_login=False)
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Login page and authentication handler."""
+    if not is_auth_enabled():
+        return redirect(url_for('index'))
+
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+
+        if not username or not password:
+            if request.is_json:
+                return jsonify({'error': 'Username and password required'}), 400
+            return render_template('index.html', show_login=True, login_error='Username and password required')
+
+        user = User.query.filter_by(username=username).first()
+        if user and user.check_password(password):
+            login_user(user, remember=True)
+            # Record login log
+            log = LoginLog(
+                user_id=user.id,
+                username=user.username,
+                ip_address=request.remote_addr or 'unknown',
+                user_agent=request.headers.get('User-Agent', '')[:256],
+                success=True
+            )
+            db.session.add(log)
+            db.session.commit()
+            logger.info(f"User logged in: {username}")
+            next_page = request.args.get('next')
+            if next_page:
+                return redirect(next_page)
+            return redirect(url_for('index'))
+
+        # Record failed login
+        if user:
+            log = LoginLog(
+                user_id=user.id,
+                username=username,
+                ip_address=request.remote_addr or 'unknown',
+                user_agent=request.headers.get('User-Agent', '')[:256],
+                success=False
+            )
+            db.session.add(log)
+            db.session.commit()
+
+        if request.is_json:
+            return jsonify({'error': 'Invalid username or password'}), 401
+        return render_template('index.html', show_login=True, login_error='Invalid username or password')
+
+    return render_template('index.html', show_login=not current_user.is_authenticated)
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    """Logout handler."""
+    if is_auth_enabled() and current_user.is_authenticated:
+        logger.info(f"User logged out: {current_user.username}")
+        logout_user()
+    return jsonify({'success': True})
+
+
+@app.route('/api/me')
+def api_me():
+    """Get current user info and auth configuration."""
+    auth_config = CONFIG.get('auth', DEFAULT_CONFIG['auth'])
+    result = {
+        'auth_enabled': is_auth_enabled(),
+        'auth_mode': auth_config.get('mode', 'relaxed')
+    }
+    if is_auth_enabled() and current_user.is_authenticated:
+        result['user'] = {
+            'id': current_user.id,
+            'username': current_user.username,
+            'role': current_user.role
+        }
+        result['is_authenticated'] = True
+    else:
+        result['is_authenticated'] = False
+    return jsonify(result)
 
 
 @app.route('/api/config')
+@require_auth
 def api_config():
     """Get frontend configuration (playback speeds, UI settings, etc)."""
+    auth_config = CONFIG.get('auth', DEFAULT_CONFIG['auth'])
     return jsonify({
         'playback': CONFIG.get('playback', DEFAULT_CONFIG['playback']),
-        'ui': CONFIG.get('ui', DEFAULT_CONFIG['ui'])
+        'ui': CONFIG.get('ui', DEFAULT_CONFIG['ui']),
+        'auth': {
+            'enabled': is_auth_enabled(),
+            'mode': auth_config.get('mode', 'relaxed')
+        }
     })
 
 
 @app.route('/api/videos')
+@require_auth
 def api_videos():
     """API endpoint to get list of videos."""
-    data = scan_videos(VIDEO_DIR)
+    data = get_video_cache()
+
+    # Add favorite status if auth is enabled and user is logged in
+    if is_auth_enabled() and current_user.is_authenticated:
+        fav_ids = {f.video_id for f in Favorite.query.filter_by(user_id=current_user.id).all()}
+        for video in data['videos']:
+            video['is_favorite'] = video['id'] in fav_ids
+        for cat_videos in data['categories'].values():
+            for video in cat_videos:
+                video['is_favorite'] = video['id'] in fav_ids
+
     return jsonify(data)
 
 
 @app.route('/api/search')
+@require_auth
 def api_search():
     """Search videos by keyword (fuzzy search)."""
+    # In relaxed mode, search requires login
+    if is_auth_enabled() and get_auth_mode() == 'relaxed' and not current_user.is_authenticated:
+        return jsonify({'error': 'Login required'}), 401
+
     keyword = request.args.get('q', '').lower().strip()
     category = request.args.get('category', '').strip()
 
@@ -438,7 +943,7 @@ def api_search():
 
     logger.info(f"Search request: '{keyword}', category: '{category}'")
 
-    data = scan_videos(VIDEO_DIR)
+    data = get_video_cache()
     all_videos = data['videos']
 
     # Filter by category first if specified
@@ -476,11 +981,17 @@ def api_search():
             results.append(video_copy)
 
     # Sort by score descending
-    results.sort(key=lambda x: (-x['_score'], x['name'].lower()))
+    results.sort(key=lambda x: (-x['_score'], ascii_sort_key(x['name'])))
 
     # Remove score from output
     for r in results:
         del r['_score']
+
+    # Add favorite status
+    if is_auth_enabled() and current_user.is_authenticated:
+        fav_ids = {f.video_id for f in Favorite.query.filter_by(user_id=current_user.id).all()}
+        for video in results:
+            video['is_favorite'] = video['id'] in fav_ids
 
     logger.info(f"Search '{keyword}' returned {len(results)} results")
 
@@ -492,16 +1003,68 @@ def api_search():
 
 
 @app.route('/api/categories')
+@require_auth
 def api_categories():
     """Get videos grouped by category."""
-    data = scan_videos(VIDEO_DIR)
+    data = get_video_cache()
+
+    if is_auth_enabled() and current_user.is_authenticated:
+        fav_ids = {f.video_id for f in Favorite.query.filter_by(user_id=current_user.id).all()}
+        for cat_videos in data['categories'].values():
+            for video in cat_videos:
+                video['is_favorite'] = video['id'] in fav_ids
+
     return jsonify({
         'categories': data['categories'],
         'count': data['count']
     })
 
 
+@app.route('/api/favorites')
+@require_login_for_feature
+def api_favorites():
+    """Get current user's favorite video IDs."""
+    if not is_auth_enabled():
+        return jsonify({'favorites': [], 'count': 0})
+    favs = Favorite.query.filter_by(user_id=current_user.id).all()
+    return jsonify({
+        'favorites': [{'video_id': f.video_id, 'created_at': f.created_at.isoformat()} for f in favs],
+        'count': len(favs)
+    })
+
+
+@app.route('/api/favorites/<video_id>', methods=['POST'])
+@require_login_for_feature
+def add_favorite(video_id):
+    """Add a video to favorites."""
+    if not is_auth_enabled():
+        return jsonify({'error': 'Authentication is disabled'}), 400
+    existing = Favorite.query.filter_by(user_id=current_user.id, video_id=video_id).first()
+    if existing:
+        return jsonify({'success': True, 'message': 'Already in favorites'})
+    fav = Favorite(user_id=current_user.id, video_id=video_id)
+    db.session.add(fav)
+    db.session.commit()
+    logger.info(f"User {current_user.username} favorited video {video_id}")
+    return jsonify({'success': True})
+
+
+@app.route('/api/favorites/<video_id>', methods=['DELETE'])
+@require_login_for_feature
+def remove_favorite(video_id):
+    """Remove a video from favorites."""
+    if not is_auth_enabled():
+        return jsonify({'error': 'Authentication is disabled'}), 400
+    fav = Favorite.query.filter_by(user_id=current_user.id, video_id=video_id).first()
+    if fav:
+        db.session.delete(fav)
+        db.session.commit()
+        logger.info(f"User {current_user.username} unfavorited video {video_id}")
+    return jsonify({'success': True})
+
+
 @app.route('/video/<path:filename>')
+@require_auth
 def serve_video(filename):
     """Serve a video file with range request support."""
     file_path = VIDEO_DIR / unquote(filename)
@@ -527,6 +1090,7 @@ def serve_video(filename):
 
 
 @app.route('/thumbnail/<path:filename>')
+@require_auth
 def serve_thumbnail(filename):
     """Serve a thumbnail image."""
     file_path = VIDEO_DIR / unquote(filename)
@@ -551,20 +1115,11 @@ def serve_thumbnail(filename):
 
 
 @app.route('/api/refresh', methods=['POST'])
+@require_role('admin')
 def refresh_thumbnails():
     """Force regeneration of all thumbnails."""
     logger.info("Refreshing all thumbnails...")
-
-    # Clear existing thumbnails
-    count = 0
-    for thumb in THUMBNAIL_DIR.glob('*.jpg'):
-        thumb.unlink()
-        count += 1
-
-    logger.info(f"Cleared {count} thumbnails")
-
-    # Regenerate
-    data = scan_videos(VIDEO_DIR)
+    data = refresh_video_cache(reason='manual admin refresh', clear_thumbnails=True)
     return jsonify({
         'message': f'Refreshed {data["count"]} thumbnails',
         'count': data['count']
@@ -572,6 +1127,7 @@ def refresh_thumbnails():
 
 
 @app.route('/api/logs')
+@require_role('admin')
 def api_logs():
     """Get recent log entries."""
     try:
@@ -594,6 +1150,92 @@ def api_logs():
         return jsonify({'error': 'Failed to read logs'}), 500
 
 
+@app.route('/api/admin/users')
+@require_role('admin')
+def api_admin_users():
+    """Get all users (admin only)."""
+    users = User.query.all()
+    return jsonify({
+        'users': [{
+            'id': u.id,
+            'username': u.username,
+            'role': u.role,
+            'created_at': u.created_at.isoformat() if u.created_at else None
+        } for u in users],
+        'count': len(users)
+    })
+
+
+@app.route('/api/admin/users', methods=['POST'])
+@require_role('admin')
+def api_admin_create_user():
+    """Create a new user (admin only)."""
+    data = request.get_json() or {}
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    role = data.get('role', 'user')
+
+    if not username or not password:
+        return jsonify({'error': 'Username and password required'}), 400
+    if role not in ('admin', 'user'):
+        return jsonify({'error': 'Role must be admin or user'}), 400
+    if User.query.filter_by(username=username).first():
+        return jsonify({'error': 'Username already exists'}), 409
+
+    user = User(username=username, role=role)
+    user.set_password(password)
+    db.session.add(user)
+    db.session.commit()
+    logger.info(f"Admin created user: {username} (role: {role})")
+    return jsonify({
+        'success': True,
+        'user': {
+            'id': user.id,
+            'username': user.username,
+            'role': user.role,
+            'created_at': user.created_at.isoformat()
+        }
+    })
+
+
+@app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
+@require_role('admin')
+def api_admin_delete_user(user_id):
+    """Delete a user (admin only). Cannot delete yourself."""
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    if user.id == current_user.id:
+        return jsonify({'error': 'Cannot delete yourself'}), 400
+
+    # Delete user's favorites first
+    Favorite.query.filter_by(user_id=user.id).delete()
+    db.session.delete(user)
+    db.session.commit()
+    logger.info(f"Admin deleted user: {user.username}")
+    return jsonify({'success': True})
+
+
+@app.route('/api/admin/login-logs')
+@require_role('admin')
+def api_admin_login_logs():
+    """Get login logs (admin only)."""
+    limit = min(int(request.args.get('limit', 100)), 500)
+    logs = LoginLog.query.order_by(LoginLog.login_time.desc()).limit(limit).all()
+    return jsonify({
+        'logs': [{
+            'id': log.id,
+            'user_id': log.user_id,
+            'username': log.username,
+            'ip_address': log.ip_address,
+            'user_agent': log.user_agent,
+            'login_time': log.login_time.isoformat() if log.login_time else None,
+            'success': log.success
+        } for log in logs],
+        'count': len(logs)
+    })
+
+
 def main():
     global VIDEO_DIR, CONFIG
 
@@ -602,6 +1244,9 @@ def main():
 
     # Setup logging with configuration
     setup_logging()
+
+    # Initialize authentication (conditionally)
+    init_auth(app)
 
     # Parse command line arguments (override config)
     video_path = CONFIG['server'].get('video_dir', '.')
@@ -627,7 +1272,8 @@ def main():
     logger.info(f"Press Ctrl+C to stop")
 
     # Scan videos on startup
-    data = scan_videos(VIDEO_DIR)
+    data = refresh_video_cache(reason='startup')
+    start_periodic_video_scan()
     print(f"\nFound {data['count']} video(s) in {len(data['categories'])} categorie(s)")
     if data['duplicate_count'] > 0:
         print(f"Skipped {data['duplicate_count']} duplicate(s)")
