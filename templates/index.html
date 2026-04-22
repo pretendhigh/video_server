@@ -6,13 +6,34 @@
     <title>Video Server</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body data-show-login="{{ 'true' if show_login else 'false' }}">
     <header>
         <h1>Video Server</h1>
         <div class="header-actions">
             <span id="video-count">Loading...</span>
-            <button id="logs-btn" class="btn-secondary">Logs</button>
-            <button id="refresh-btn" class="btn-secondary">Refresh</button>
+            <div class="auth-bar" id="auth-bar">
+                <button id="login-btn" class="btn-secondary hidden">Login</button>
+                <div id="user-menu" class="user-menu hidden">
+                    <button id="user-menu-trigger" class="avatar-btn" type="button" aria-haspopup="true" aria-expanded="false" title="Open account menu">
+                        <span id="avatar-initials">VS</span>
+                    </button>
+                    <div id="user-menu-dropdown" class="user-menu-dropdown hidden">
+                        <div class="user-menu-profile">
+                            <div id="user-menu-avatar" class="user-menu-avatar">VS</div>
+                            <div class="user-menu-copy">
+                                <div id="username-display" class="user-menu-name">Video Server</div>
+                                <div id="user-role-display" class="user-menu-role">Guest</div>
+                            </div>
+                        </div>
+                        <div class="user-menu-actions">
+                            <button id="refresh-btn" class="user-menu-item hidden" type="button">Refresh</button>
+                            <button id="admin-btn" class="user-menu-item hidden" type="button">Admin</button>
+                            <button id="logs-btn" class="user-menu-item hidden" type="button">Logs</button>
+                            <button id="logout-btn" class="user-menu-item" type="button">Logout</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
     </header>
 
@@ -24,12 +45,20 @@
     </div>
 
     <!-- Category Tabs -->
-    <div class="category-tabs" id="category-tabs">
-        <button class="tab-btn active" data-category="all">All</button>
+    <div class="category-tabs-bar">
+        <button id="category-tabs-prev" class="category-tabs-nav" type="button" aria-label="Show previous categories" title="Previous category" disabled>
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M14.71 6.71a1 1 0 0 1 0 1.41L10.83 12l3.88 3.88a1 1 0 1 1-1.42 1.41l-4.59-4.59a1 1 0 0 1 0-1.41l4.59-4.59a1 1 0 0 1 1.42 0z"/></svg>
+        </button>
+        <div class="category-tabs" id="category-tabs">
+            <button class="tab-btn active" data-category="all">All</button>
+        </div>
+        <button id="category-tabs-next" class="category-tabs-nav" type="button" aria-label="Show next categories" title="Next category" disabled>
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M9.29 6.71a1 1 0 0 1 1.42 0l4.59 4.59a1 1 0 0 1 0 1.41l-4.59 4.59a1 1 0 1 1-1.42-1.41L13.17 12 9.29 8.12a1 1 0 0 1 0-1.41z"/></svg>
+        </button>
     </div>
 
     <main>
-        <div id="loading" class="loading">Scanning videos...</div>
+        <div id="loading" class="loading">Loading videos...</div>
         <div id="video-grid" class="video-grid"></div>
         <div id="empty-state" class="empty-state hidden">
             <p>No videos found in this directory.</p>
@@ -113,6 +142,11 @@
                                 <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
                             </button>
 
+                            <!-- Favorite Button -->
+                            <button class="ctrl-icon-btn hidden" id="ctrl-favorite" title="收藏">
+                                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+                            </button>
+
                             <!-- Fullscreen Button -->
                             <button class="ctrl-icon-btn" id="ctrl-fullscreen" title="全屏 (F)">
                                 <svg class="icon-fullscreen" viewBox="0 0 24 24" fill="currentColor"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
@@ -120,6 +154,88 @@
                             </button>
                         </div>
                     </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Login Modal -->
+    <div id="login-modal" class="modal hidden">
+        <div class="modal-overlay"></div>
+        <div class="modal-content login-modal-content">
+            <div class="player-header">
+                <h3>Login</h3>
+                <button id="close-login" class="btn-close">&times;</button>
+            </div>
+            <div class="login-form">
+                <div id="login-error" class="login-error hidden"></div>
+                <div class="form-group">
+                    <label for="login-username">Username</label>
+                    <input type="text" id="login-username" placeholder="Enter username" autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label for="login-password">Password</label>
+                    <input type="password" id="login-password" placeholder="Enter password" autocomplete="current-password">
+                </div>
+                <button id="login-submit" class="btn-primary btn-full">Login</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Admin Modal -->
+    <div id="admin-modal" class="modal hidden">
+        <div class="modal-overlay"></div>
+        <div class="modal-content admin-modal-content">
+            <div class="player-header">
+                <h3>Admin Panel</h3>
+                <button id="close-admin" class="btn-close">&times;</button>
+            </div>
+            <div class="admin-tabs">
+                <button class="admin-tab-btn active" data-admin-tab="users">Users</button>
+                <button class="admin-tab-btn" data-admin-tab="login-logs">Login Logs</button>
+            </div>
+            <div class="admin-body">
+                <div id="admin-users-tab" class="admin-tab-content">
+                    <div class="admin-toolbar">
+                        <button id="admin-add-user-btn" class="btn-primary">Add User</button>
+                    </div>
+                    <table class="admin-table" id="admin-users-table">
+                        <thead>
+                            <tr><th>ID</th><th>Username</th><th>Role</th><th>Created</th><th>Actions</th></tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                    <div id="admin-add-user-form" class="hidden">
+                        <h4>Add New User</h4>
+                        <div class="form-group">
+                            <label>Username</label>
+                            <input type="text" id="admin-new-username" placeholder="Username">
+                        </div>
+                        <div class="form-group">
+                            <label>Password</label>
+                            <input type="password" id="admin-new-password" placeholder="Password">
+                        </div>
+                        <div class="form-group">
+                            <label>Role</label>
+                            <select id="admin-new-role">
+                                <option value="user">User</option>
+                                <option value="admin">Admin</option>
+                            </select>
+                        </div>
+                        <div class="admin-form-actions">
+                            <button id="admin-create-user-btn" class="btn-primary">Create</button>
+                            <button id="admin-cancel-user-btn" class="btn-secondary">Cancel</button>
+                        </div>
+                        <div id="admin-user-error" class="login-error hidden"></div>
+                    </div>
+                </div>
+                <div id="admin-login-logs-tab" class="admin-tab-content hidden">
+                    <table class="admin-table" id="admin-logs-table">
+                        <thead>
+                            <tr><th>Time</th><th>User</th><th>IP</th><th>Status</th></tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
                 </div>
             </div>
         </div>

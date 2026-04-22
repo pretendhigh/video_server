@@ -32,9 +32,34 @@
         "_format_desc": "Python logging format string. See: https://docs.python.org/3/library/logging.html"
     },
 
+    "scan": {
+        "_comment": "Video scan and duplicate detection settings",
+        "interval_seconds": 300,
+        "_interval_seconds_desc": "How often the server rescans the video library in the background. Default: 300 seconds. Set to 0 to disable automatic rescans; in that case, the admin Refresh action triggers a rescan.",
+        "content_hash_algorithms": ["sha1"],
+        "_content_hash_algorithms_desc": "Algorithms used to compare same-name files by actual content. Supports names like md5, sha1, sha256 and aliases like md5sum, sha1sum. If multiple algorithms are configured, all hashes must match to treat files as identical."
+    },
+
     "ui": {
         "_comment": "User interface settings",
         "controls_hide_delay": 3000,
         "_controls_hide_delay_desc": "Time in milliseconds before hiding controls in fullscreen mode when mouse is idle. Default: 3000 (3 seconds)"
+    },
+
+    "auth": {
+        "_comment": "Authentication configuration",
+        "enabled": false,
+        "_enabled_desc": "Enable authentication. When false, no login required and no database is created.",
+        "mode": "relaxed",
+        "_mode_desc": "Authentication mode: 'strict' (login required for all access) or 'relaxed' (login only required for search, favorites, logs, refresh)",
+        "secret_key": null,
+        "_secret_key_desc": "Flask secret key for session signing. If null, a key is auto-generated and stored in .secret_key file.",
+        "session_days": 7,
+        "_session_days_desc": "Session lifetime in days. Default: 7",
+        "users": [
+            {"username": "admin", "password": "changeme", "role": "admin"},
+            {"username": "user", "password": "changeme", "role": "user"}
+        ],
+        "_users_desc": "Initial users to create on first startup. Passwords are hashed on creation. Change default passwords!"
     }
 }
